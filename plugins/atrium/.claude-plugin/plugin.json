@@ -1,0 +1,9 @@
+{
+  "name": "atrium",
+  "version": "0.2.0",
+  "description": "Atrium Harness execution rituals — the build/verify and triage/discovery how-to for an unattended session. Carries the durable file-based contract (done-when.json, decision.json, checks.json, report.md). NOT the security floor (that stays non-pluggable via --append-system-prompt) and NOT the MCP server (that stays in --mcp-config + --strict-mcp-config).",
+  "author": { "name": "Atrium" },
+  "homepage": "https://atriumapp.ai",
+  "license": "Apache-2.0",
+  "keywords": ["atrium", "agent", "runner", "workflow", "triage", "mcp"]
+}

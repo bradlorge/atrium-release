@@ -1,0 +1,23 @@
+{
+  "name": "atrium",
+  "owner": {
+    "name": "Atrium",
+    "url": "https://atriumapp.ai"
+  },
+  "metadata": {
+    "description": "The Atrium Harness skills pack — operating rituals for agent sessions working a product through Atrium's compact MCP surface.",
+    "version": "0.2.0"
+  },
+  "plugins": [
+    {
+      "name": "atrium",
+      "source": "./plugins/atrium",
+      "description": "Atrium Harness execution rituals — build/verify + triage/discovery how-to for an unattended session, over the compact MCP surface. Each skill is allowed-tools scoped to exactly what it needs.",
+      "version": "0.2.0",
+      "author": { "name": "Atrium" },
+      "homepage": "https://atriumapp.ai",
+      "license": "Apache-2.0",
+      "keywords": ["atrium", "agent", "runner", "workflow", "triage", "mcp"]
+    }
+  ]
+}
