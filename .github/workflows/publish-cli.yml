@@ -1,0 +1,231 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Atrium CLI publish — the RELEASE-REPO half of a two-repo release.
+#
+# ⚠ THIS FILE IS A TEMPLATE. It lives in the SOURCE repo (sottoai/atrium) at
+#   `cli/dist-release/publish-cli.yml` for review + version control, but it does
+#   NOTHING here — the source repo carries no `release: published` events for
+#   cli-v* tags. COPY it into the PUBLIC release repo as
+#   `bradlorge/atrium-release/.github/workflows/publish-cli.yml`. That is the only
+#   place it runs.
+#
+# ── WHAT IT DOES ─────────────────────────────────────────────────────────────
+#
+# The source repo's release-cli.yml stages a `cli-vX.Y.Z` GitHub release on this
+# (public) repo, carrying `sottoai-atrium-cli-X.Y.Z.tgz` + its `.sha256`. This
+# workflow fires on that release, downloads the tarball, verifies the checksum,
+# and runs the ONE real, provenance-signed npm publish — from a PUBLIC repo, so
+# the sigstore transparency-log write names a public builder and provenance is
+# verifiable (a private builder cannot attest, which is why the publish moved
+# here out of the private source).
+#
+# ── THE FIRST PUBLISH IS HELD (env-gated) ────────────────────────────────────
+#
+# `assert-npm-gate` fails CLOSED unless the repo variable
+# ATRIUM_CLI_PUBLISH_ENABLED == 'true' AND the `npm-publish` GitHub Environment
+# exists with a required reviewer. A referenced-but-unconfigured environment has
+# ZERO protection rules, so `environment:` alone is not default-closed — the
+# ungated assert job proves the gate exists before the gated `publish` job binds
+# to it. (This is deploy-prod.yml / the old release-cli.yml assert-gate pattern,
+# applied in the repo where the credential now lives.)
+#
+# ── OPERATOR SETUP — done ONCE, in bradlorge/atrium-release ──────────────────
+#
+#   (a) Own the `@sottoai` npm scope (and decide whether to also claim the
+#       unscoped `atrium` name).
+#   (b) Configure npm TRUSTED PUBLISHING for @sottoai/atrium-cli against
+#       bradlorge/atrium-release + THIS workflow file. That is what makes
+#       `--provenance` verifiable with no long-lived token. A classic automation
+#       token in the `npm-publish` environment as NPM_TOKEN is the fallback.
+#   (c) Create the `npm-publish` Environment with a required reviewer.
+#   (d) Set the repo variable ATRIUM_CLI_PUBLISH_ENABLED = 'true'.
+#
+#   ⚠ (e) `cli/package.json` declares `"license": "UNLICENSED"` while
+#       `publishConfig.access` is `public`. Publishing a world-installable package
+#       under a licence that forbids use is a decision, not an oversight — settle
+#       it before (d).
+#
+#   ⚠ (f) PROVENANCE REPOSITORY LINKAGE. The tarball's package.json carries
+#       `repository.url = github.com/sottoai/atrium` (needed so npm can validate
+#       provenance at all — a missing field is a 422). But `--provenance` attests
+#       the BUILDER repo, which is bradlorge/atrium-release. npm validates the
+#       manifest's repository against the attested builder, so the two must be
+#       reconciled ONE way before the first publish:
+#         • point the source tarball's repository.url at bradlorge/atrium-release
+#           (a build-time rewrite in the source repo), OR
+#         • configure trusted publishing so npm accepts this builder for the
+#           @sottoai/atrium-cli package.
+#       Verify with a single dispatch (publish disabled) and read npm's response
+#       before flipping (d). This is the one cross-repo seam the split introduces.
+# ─────────────────────────────────────────────────────────────────────────────
+name: publish-cli
+
+on:
+  # The source repo's stage-release job created this release.
+  release:
+    types: [published]
+  # Manual re-run for an existing cli-v* release tag.
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "cli-vX.Y.Z release tag to publish (e.g. cli-v0.1.0)"
+        required: true
+        type: string
+
+concurrency:
+  group: publish-cli-${{ github.event.release.tag_name || inputs.release_tag }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  # ── 0. guard — resolve + validate the tag, untrusted-input-safe ────────────
+  # The tag is UNTRUSTED input (a release title or a dispatch string) and a
+  # successor job holds a publish credential, so it enters scripts via `env:`,
+  # never inline `${{ }}` in a `run:`. The strict format check makes the derived
+  # outputs safe downstream — and filters the release event down to cli-v* tags
+  # (a `release: published` fires for EVERY release in this repo, incl. the
+  # runner's vX.Y.Z ones, which this workflow must ignore).
+  guard:
+    name: guard (cli-v* tag format · version)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.check.outputs.version }}
+      tag: ${{ steps.check.outputs.tag }}
+      is_cli: ${{ steps.check.outputs.is_cli }}
+    steps:
+      - name: Validate + derive
+        id: check
+        env:
+          TAG: ${{ github.event.release.tag_name || inputs.release_tag }}
+        run: |
+          set -euo pipefail
+          if ! printf '%s' "$TAG" | grep -Eq '^cli-v[0-9]+\.[0-9]+\.[0-9]+(-[a-z0-9.]+)?$'; then
+            # Not a CLI release (e.g. a runner vX.Y.Z tag) — exit cleanly, publish
+            # nothing. A malformed cli-* tag from a manual dispatch is a hard error.
+            case "$TAG" in
+              cli-*) echo "::error::Tag '$TAG' looks like a CLI tag but is not cli-vX.Y.Z[-pre]. Refusing."; exit 1 ;;
+              *) echo "::notice::'$TAG' is not a cli-v* release — nothing to publish."; echo "is_cli=false" >> "$GITHUB_OUTPUT"; exit 0 ;;
+            esac
+          fi
+          VERSION="${TAG#cli-v}"
+          {
+            echo "is_cli=true"
+            echo "version=$VERSION"
+            echo "tag=$TAG"
+          } >> "$GITHUB_OUTPUT"
+          echo "cli release $VERSION from $TAG"
+
+  # ── 1. assert-npm-gate — prove the gate EXISTS before the gated job runs ───
+  # Fails CLOSED: the FIRST publish is held on ATRIUM_CLI_PUBLISH_ENABLED, and a
+  # referenced-but-unconfigured environment has no protection rules, so binding to
+  # it would publish instantly and unapproved. Ungated job: it can read config but
+  # holds no publish credential.
+  assert-npm-gate:
+    name: assert the npm-publish gate is configured
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    needs: guard
+    if: needs.guard.outputs.is_cli == 'true'
+    env:
+      GH_TOKEN: ${{ github.token }}
+      PUBLISH_ENABLED: ${{ vars.ATRIUM_CLI_PUBLISH_ENABLED }}
+    steps:
+      - name: Guard — release valve + required reviewers
+        run: |
+          set -euo pipefail
+
+          # (1) The release valve. The FIRST publish is held for the operator.
+          if [ "${PUBLISH_ENABLED:-}" != "true" ]; then
+            echo "::error::ATRIUM_CLI_PUBLISH_ENABLED is not 'true'. The first real npm publish is HELD until the operator has claimed the @sottoai scope and configured npm trusted publishing (see this file's header). Failing CLOSED."
+            exit 1
+          fi
+
+          # (2) The approval gate itself must exist with a required reviewer.
+          if ! ENV_JSON="$(gh api "repos/${GITHUB_REPOSITORY}/environments/npm-publish" 2>/dev/null)"; then
+            echo "::error::Could not read the 'npm-publish' GitHub Environment (missing, or the token cannot read it). Create and configure it per this file's header. Failing CLOSED."
+            exit 1
+          fi
+          REVIEWERS="$(jq -r '[.protection_rules[]? | select(.type == "required_reviewers")] | length' <<<"$ENV_JSON")"
+          if [ "$REVIEWERS" -eq 0 ]; then
+            echo "::error::The 'npm-publish' environment has NO required reviewers — the approval gate does not exist and this run would publish immediately. Add one (Settings → Environments → npm-publish)."
+            exit 1
+          fi
+          echo "npm-publish gate OK (valve on, reviewers required)."
+
+  # ── 2. publish — the ONE real publish, PAUSES for a human on the environment ─
+  publish:
+    name: npm publish --provenance (approval-gated)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: [guard, assert-npm-gate]
+    if: needs.guard.outputs.is_cli == 'true'
+    environment:
+      name: npm-publish
+      url: https://www.npmjs.com/package/@sottoai/atrium-cli
+    permissions:
+      contents: read
+      # Provenance: the attestation is signed with this run's OIDC identity, and
+      # it is also what npm trusted publishing authenticates with. Valid here
+      # because THIS repo is public.
+      id-token: write
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+
+      # setup-node@v4 on node 22 ships npm 10, which supports `--provenance` but
+      # NOT OIDC trusted publishing (npm >= 11.5). Upgrading keeps the token path
+      # optional rather than mandatory.
+      - name: Use an npm that can trusted-publish
+        run: npm install -g npm@11
+
+      - name: Download the staged tarball + checksum from the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.guard.outputs.tag }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist-release
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" \
+            --pattern '*.tgz' --pattern '*.tgz.sha256' --dir dist-release --clobber
+          ls -la dist-release
+
+      - name: Verify the checksum before anything is published
+        env:
+          VERSION: ${{ needs.guard.outputs.version }}
+        run: |
+          set -euo pipefail
+          cd dist-release
+          TARBALL="sottoai-atrium-cli-${VERSION}.tgz"
+          test -f "$TARBALL" || { echo "::error::missing $TARBALL"; exit 1; }
+          test -f "$TARBALL.sha256" || { echo "::error::missing $TARBALL.sha256"; exit 1; }
+          sha256sum -c "$TARBALL.sha256"
+          echo "checksum verified for $TARBALL"
+
+      - name: Publish
+        env:
+          # Empty when trusted publishing is configured — npm then authenticates
+          # with the OIDC identity above and no long-lived credential exists.
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          VERSION: ${{ needs.guard.outputs.version }}
+        run: |
+          set -euo pipefail
+          cd dist-release
+          TARBALL="sottoai-atrium-cli-${VERSION}.tgz"
+          echo "publishing @sottoai/atrium-cli@$VERSION from $TARBALL"
+          npm publish "$TARBALL" --provenance --access public
+
+      - name: Summarise
+        env:
+          VERSION: ${{ needs.guard.outputs.version }}
+        run: |
+          {
+            echo "### @sottoai/atrium-cli@$VERSION published"
+            echo ""
+            echo '```sh'
+            echo "npx @sottoai/atrium-cli@$VERSION --version"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
